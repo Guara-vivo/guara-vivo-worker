@@ -5,7 +5,7 @@ import shutil
 import tempfile
 import time
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +35,7 @@ RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD", "guest")
 QUEUE_NAME = os.getenv("QUEUE_NAME", "guara-vermelho-inference")
 ERROR_QUEUE_NAME = os.getenv("ERROR_QUEUE_NAME", f"{QUEUE_NAME}-error")
 IA_API_URL = os.getenv("IA_API_URL", "http://ia-api:8000/guara-vermelho/inference")
+DEBUG_SAVE_IMAGES_DIR = os.getenv("DEBUG_SAVE_IMAGES_DIR", "").strip()
 
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 RABBITMQ_RECONNECT_SECONDS = int(os.getenv("RABBITMQ_RECONNECT_SECONDS", "5"))
@@ -172,21 +173,68 @@ def download_images(image_urls: list[str], directory: Path) -> list[Path]:
     return image_paths
 
 
-def call_ia_api(image_paths: list[Path]) -> dict[str, Any]:
-    files = []
-    opened_files = []
-    try:
-        for image_path in image_paths:
-            file_obj = image_path.open("rb")
-            opened_files.append(file_obj)
-            files.append(("files", (image_path.name, file_obj, "image/jpeg")))
+def save_debug_images(record_id: int, image_paths: list[Path], image_urls: list[str]) -> None:
+    if not DEBUG_SAVE_IMAGES_DIR:
+        return
 
-        response = requests.post(IA_API_URL, files=files, timeout=IA_TIMEOUT_SECONDS)
-        response.raise_for_status()
-        return response.json()
-    finally:
-        for file_obj in opened_files:
-            file_obj.close()
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    debug_dir = Path(DEBUG_SAVE_IMAGES_DIR) / f"record_{record_id}_{timestamp}"
+
+    try:
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        metadata = []
+        for index, image_path in enumerate(image_paths):
+            debug_image_path = debug_dir / image_path.name
+            shutil.copy2(image_path, debug_image_path)
+            metadata.append(
+                {
+                    "source_url": image_urls[index] if index < len(image_urls) else None,
+                    "saved_file": debug_image_path.name,
+                    "size_bytes": debug_image_path.stat().st_size,
+                }
+            )
+
+        (debug_dir / "metadata.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        logger.info("saved %s debug image(s) for record %s to %s", len(image_paths), record_id, debug_dir)
+    except Exception:
+        logger.exception("could not save debug images for record %s", record_id)
+
+
+def call_ia_api(image_paths: list[Path]) -> dict[str, Any]:
+    image_results = []
+    all_guaras = []
+    total_guaras = 0
+
+    for image_path in image_paths:
+        with image_path.open("rb") as file_obj:
+            response = requests.post(
+                IA_API_URL,
+                files={"image": (image_path.name, file_obj, "image/jpeg")},
+                timeout=IA_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+
+        image_result = response.json()
+        image_results.append(image_result)
+
+        guaras = image_result.get("guaras")
+        if isinstance(guaras, list):
+            all_guaras.extend(item for item in guaras if isinstance(item, dict))
+
+        quantidade_guaras = image_result.get("quantidade_guaras")
+        if isinstance(quantidade_guaras, int):
+            total_guaras += quantidade_guaras
+        elif isinstance(guaras, list):
+            total_guaras += len([item for item in guaras if isinstance(item, dict)])
+
+    return {
+        "quantidade_guaras": total_guaras,
+        "guaras": all_guaras,
+        "imagens": image_results,
+    }
 
 
 def extract_ibis_items(ia_result: dict[str, Any]) -> list[dict[str, Any]]:
@@ -253,6 +301,7 @@ def process_record(record_id: int) -> None:
     try:
         record = fetch_record(record_id)
         image_paths = download_images(record["images"], work_dir)
+        save_debug_images(record_id, image_paths, record["images"])
         ia_result = call_ia_api(image_paths)
         save_analysis(record, ia_result)
         logger.info("record %s processed successfully", record_id)
