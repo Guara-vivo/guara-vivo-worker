@@ -173,9 +173,9 @@ def download_images(image_urls: list[str], directory: Path) -> list[Path]:
     return image_paths
 
 
-def save_debug_images(record_id: int, image_paths: list[Path], image_urls: list[str]) -> None:
+def save_debug_images(record_id: int, image_paths: list[Path], image_urls: list[str]) -> Path | None:
     if not DEBUG_SAVE_IMAGES_DIR:
-        return
+        return None
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     debug_dir = Path(DEBUG_SAVE_IMAGES_DIR) / f"record_{record_id}_{timestamp}"
@@ -199,11 +199,13 @@ def save_debug_images(record_id: int, image_paths: list[Path], image_urls: list[
             encoding="utf-8",
         )
         logger.info("saved %s debug image(s) for record %s to %s", len(image_paths), record_id, debug_dir)
+        return debug_dir
     except Exception:
         logger.exception("could not save debug images for record %s", record_id)
+        return None
 
 
-def call_ia_api(image_paths: list[Path]) -> dict[str, Any]:
+def call_ia_api(image_paths: list[Path], debug_dir: Path | None = None) -> dict[str, Any]:
     image_results = []
     all_guaras = []
     total_guaras = 0
@@ -219,6 +221,11 @@ def call_ia_api(image_paths: list[Path]) -> dict[str, Any]:
 
         image_result = response.json()
         image_results.append(image_result)
+        if debug_dir is not None:
+            (debug_dir / f"ia_result_{len(image_results)}.json").write_text(
+                json.dumps(image_result, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
         guaras = image_result.get("guaras")
         if isinstance(guaras, list):
@@ -230,26 +237,30 @@ def call_ia_api(image_paths: list[Path]) -> dict[str, Any]:
         elif isinstance(guaras, list):
             total_guaras += len([item for item in guaras if isinstance(item, dict)])
 
-    return {
+    result = {
         "quantidade_guaras": total_guaras,
         "guaras": all_guaras,
         "imagens": image_results,
     }
+    if debug_dir is not None:
+        (debug_dir / "ia_result_aggregated.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    return result
 
 
 def extract_ibis_items(ia_result: dict[str, Any]) -> list[dict[str, Any]]:
-    for key in ("guaras"):
-        value = ia_result.get(key)
-        if isinstance(value, list):
-            return [item for item in value if isinstance(item, dict)]
+    value = ia_result.get("guaras")
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
     return []
 
 
 def extract_ibis_quantity(ia_result: dict[str, Any], ibis_items: list[dict[str, Any]]) -> int:
-    for key in ("quantidade_guaras"):
-        value = ia_result.get(key)
-        if isinstance(value, int):
-            return value
+    value = ia_result.get("quantidade_guaras")
+    if isinstance(value, int):
+        return value
     return len(ibis_items)
 
 
@@ -301,8 +312,8 @@ def process_record(record_id: int) -> None:
     try:
         record = fetch_record(record_id)
         image_paths = download_images(record["images"], work_dir)
-        save_debug_images(record_id, image_paths, record["images"])
-        ia_result = call_ia_api(image_paths)
+        debug_dir = save_debug_images(record_id, image_paths, record["images"])
+        ia_result = call_ia_api(image_paths, debug_dir)
         save_analysis(record, ia_result)
         logger.info("record %s processed successfully", record_id)
     finally:
