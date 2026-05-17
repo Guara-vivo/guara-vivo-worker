@@ -190,7 +190,7 @@ def call_ia_api(image_paths: list[Path]) -> dict[str, Any]:
 
 
 def extract_ibis_items(ia_result: dict[str, Any]) -> list[dict[str, Any]]:
-    for key in ("ibis", "birds", "detections", "items"):
+    for key in ("guaras"):
         value = ia_result.get(key)
         if isinstance(value, list):
             return [item for item in value if isinstance(item, dict)]
@@ -198,7 +198,7 @@ def extract_ibis_items(ia_result: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def extract_ibis_quantity(ia_result: dict[str, Any], ibis_items: list[dict[str, Any]]) -> int:
-    for key in ("ibis_quantity", "guara_count", "count", "quantity"):
+    for key in ("quantidade_guaras"):
         value = ia_result.get(key)
         if isinstance(value, int):
             return value
@@ -236,8 +236,8 @@ def save_analysis(record: dict[str, Any], ia_result: dict[str, Any]) -> None:
                     VALUES (%s, %s, %s)
                     """,
                     (
-                        ibis_item.get("color") or ibis_item.get("feather_color") or "unknown",
-                        ibis_item.get("age_group") or ibis_item.get("age") or "unknown",
+                        ibis_item.get("cor"),
+                        ibis_item.get("fase_vida"),
                         analysis_id,
                     ),
                 )
