@@ -270,6 +270,7 @@ def save_analysis(record: dict[str, Any], ia_result: dict[str, Any]) -> None:
 
     with db_connection() as conn:
         with conn.cursor() as cursor:
+            # Create or update aggregate analysis
             cursor.execute(
                 """
                 INSERT INTO analyses (ibis_quantity, datetime, recorder_id)
@@ -287,7 +288,10 @@ def save_analysis(record: dict[str, Any], ia_result: dict[str, Any]) -> None:
             )
             analysis_id = cursor.fetchone()[0]
 
+            # Delete existing aggregate ibis items
             cursor.execute("DELETE FROM ibis WHERE analysis_id = %s", (analysis_id,))
+            
+            # Insert aggregate ibis items for backward compatibility
             for ibis_item in ibis_items:
                 cursor.execute(
                     """
@@ -300,6 +304,56 @@ def save_analysis(record: dict[str, Any], ia_result: dict[str, Any]) -> None:
                         analysis_id,
                     ),
                 )
+
+            # Process per-image analysis
+            image_results = ia_result.get("imagens", [])
+            for image_index, image_result in enumerate(image_results):
+                image_url = record["images"][image_index] if image_index < len(record["images"]) else ""
+                image_ibis_items = [item for item in image_result.get("guaras", []) if isinstance(item, dict)]
+                image_ibis_quantity = image_result.get("quantidade_guaras", len(image_ibis_items))
+                raw_result = json.dumps(image_result, ensure_ascii=False)
+
+                # Insert analysis_image
+                cursor.execute(
+                    """
+                    INSERT INTO analysis_images 
+                    (analysis_id, record_id, image_index, image_url, ibis_quantity, raw_result, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        analysis_id,
+                        record["id"],
+                        image_index,
+                        image_url,
+                        image_ibis_quantity,
+                        raw_result,
+                        datetime.now(timezone.utc),
+                    ),
+                )
+                analysis_image_id = cursor.fetchone()[0]
+
+                # Delete existing ibis items for this analysis_image
+                cursor.execute(
+                    "DELETE FROM ibis WHERE analysis_image_id = %s",
+                    (analysis_image_id,),
+                )
+
+                # Insert per-image ibis detections
+                for ibis_item in image_ibis_items:
+                    cursor.execute(
+                        """
+                        INSERT INTO ibis (color, age_group, analysis_id, analysis_image_id, raw_detection)
+                        VALUES (%s, %s, %s, %s, %s)
+                        """,
+                        (
+                            ibis_item.get("cor"),
+                            ibis_item.get("fase_vida"),
+                            analysis_id,
+                            analysis_image_id,
+                            json.dumps(ibis_item, ensure_ascii=False),
+                        ),
+                    )
 
             cursor.execute(
                 "UPDATE records SET status = 'completed' WHERE id = %s",
