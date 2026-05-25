@@ -1,13 +1,16 @@
+import ipaddress
 import json
 import logging
 import os
 import shutil
+import socket
 import tempfile
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import pika
 import psycopg2
@@ -30,8 +33,8 @@ logger = logging.getLogger("guara-vivo-worker")
 DATABASE_URL = os.getenv("DATABASE_URL")
 RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "rabbitmq")
 RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", "5672"))
-RABBITMQ_USER = os.getenv("RABBITMQ_USER", "guest")
-RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD", "guest")
+RABBITMQ_USER = os.getenv("RABBITMQ_USER")
+RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD")
 QUEUE_NAME = os.getenv("QUEUE_NAME", "guara-vermelho-inference")
 ERROR_QUEUE_NAME = os.getenv("ERROR_QUEUE_NAME", f"{QUEUE_NAME}-error")
 IA_API_URL = os.getenv("IA_API_URL", "http://ia-api:8000/guara-vermelho/inference")
@@ -41,10 +44,24 @@ MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 RABBITMQ_RECONNECT_SECONDS = int(os.getenv("RABBITMQ_RECONNECT_SECONDS", "5"))
 DOWNLOAD_TIMEOUT_SECONDS = int(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "30"))
 IA_TIMEOUT_SECONDS = int(os.getenv("IA_TIMEOUT_SECONDS", "60"))
+ALLOWED_IMAGE_HOSTS = {
+    value.strip().lower()
+    for value in os.getenv("ALLOWED_IMAGE_HOSTS", "").split(",")
+    if value.strip()
+}
+MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(10 * 1024 * 1024)))
+RABBITMQ_HEARTBEAT_SECONDS = int(os.getenv("RABBITMQ_HEARTBEAT_SECONDS", "600"))
+RABBITMQ_BLOCKED_CONNECTION_TIMEOUT_SECONDS = int(
+    os.getenv("RABBITMQ_BLOCKED_CONNECTION_TIMEOUT_SECONDS", "300")
+)
+DEBUG_MAX_RUNS = int(os.getenv("DEBUG_MAX_RUNS", "20"))
 
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is required")
+
+if not RABBITMQ_USER or not RABBITMQ_PASSWORD:
+    raise RuntimeError("RABBITMQ_USER and RABBITMQ_PASSWORD are required")
 
 
 def normalize_database_url(database_url: str) -> str:
@@ -79,8 +96,8 @@ def connect_rabbitmq() -> pika.BlockingConnection:
         host=RABBITMQ_HOST,
         port=RABBITMQ_PORT,
         credentials=credentials,
-        heartbeat=60,
-        blocked_connection_timeout=300,
+        heartbeat=RABBITMQ_HEARTBEAT_SECONDS,
+        blocked_connection_timeout=RABBITMQ_BLOCKED_CONNECTION_TIMEOUT_SECONDS,
     )
     return pika.BlockingConnection(parameters)
 
@@ -131,6 +148,7 @@ def fetch_record(record_id: int) -> dict[str, Any]:
                 UPDATE records
                 SET status = 'processing'
                 WHERE id = %s
+                  AND status IN ('pending', 'failed')
                 RETURNING id, images, latitude_camera, longitude_camera, date_time
                 """,
                 (record_id,),
@@ -138,11 +156,31 @@ def fetch_record(record_id: int) -> dict[str, Any]:
             record = cursor.fetchone()
 
     if record is None:
-        raise ValueError(f"record {record_id} not found")
+        raise ValueError(f"record {record_id} not found or not available for processing")
     if not record["images"]:
         raise ValueError(f"record {record_id} has no images")
 
     return dict(record)
+
+
+def validate_image_url(image_url: str) -> None:
+    parsed = urlparse(image_url)
+
+    if parsed.scheme != "https":
+        raise ValueError(f"image URL must use https: {image_url}")
+
+    if not parsed.hostname:
+        raise ValueError(f"image URL must contain hostname: {image_url}")
+
+    hostname = parsed.hostname.lower()
+
+    if ALLOWED_IMAGE_HOSTS and hostname not in ALLOWED_IMAGE_HOSTS:
+        raise ValueError(f"image host is not allowed: {hostname}")
+
+    for result in socket.getaddrinfo(hostname, None):
+        ip = ipaddress.ip_address(result[4][0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            raise ValueError(f"image URL resolves to unsafe IP: {hostname}")
 
 
 def update_record_status(record_id: int, status: str) -> None:
@@ -154,23 +192,75 @@ def update_record_status(record_id: int, status: str) -> None:
             )
 
 
+def guess_image_extension(content_type: str) -> str:
+    content_type = content_type.lower().split(";")[0].strip()
+    return {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+    }.get(content_type, ".img")
+
+
+def mime_type_for_image(image_path: Path) -> str:
+    return {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+    }.get(image_path.suffix.lower(), "application/octet-stream")
+
+
 def download_images(image_urls: list[str], directory: Path) -> list[Path]:
     image_paths = []
+
     for index, image_url in enumerate(image_urls, start=1):
-        response = requests.get(image_url, timeout=DOWNLOAD_TIMEOUT_SECONDS)
-        response.raise_for_status()
+        validate_image_url(image_url)
 
-        content_type = response.headers.get("content-type", "")
-        if content_type and not content_type.lower().startswith("image/"):
-            raise ValueError(f"URL is not an image: {image_url}")
+        with requests.get(image_url, timeout=DOWNLOAD_TIMEOUT_SECONDS, stream=True) as response:
+            response.raise_for_status()
 
-        image_path = directory / f"image_{index}.jpg"
-        image_path.write_bytes(response.content)
+            content_type = response.headers.get("content-type", "")
+            if not content_type.lower().startswith("image/"):
+                raise ValueError(f"URL is not an image: {image_url}")
+
+            image_path = directory / f"image_{index}{guess_image_extension(content_type)}"
+            total_bytes = 0
+
+            with image_path.open("wb") as file_obj:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+
+                    total_bytes += len(chunk)
+                    if total_bytes > MAX_IMAGE_BYTES:
+                        raise ValueError(f"image exceeds max size: {image_url}")
+
+                    file_obj.write(chunk)
+
         if image_path.stat().st_size == 0:
             raise ValueError(f"downloaded empty image: {image_url}")
+
         image_paths.append(image_path)
 
     return image_paths
+
+
+def cleanup_debug_dir() -> None:
+    if not DEBUG_SAVE_IMAGES_DIR:
+        return
+
+    base_dir = Path(DEBUG_SAVE_IMAGES_DIR)
+    if not base_dir.exists():
+        return
+
+    debug_dirs = sorted(
+        [path for path in base_dir.iterdir() if path.is_dir()],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+    for old_dir in debug_dirs[DEBUG_MAX_RUNS:]:
+        shutil.rmtree(old_dir, ignore_errors=True)
 
 
 def save_debug_images(record_id: int, image_paths: list[Path], image_urls: list[str]) -> Path | None:
@@ -199,6 +289,7 @@ def save_debug_images(record_id: int, image_paths: list[Path], image_urls: list[
             encoding="utf-8",
         )
         logger.info("saved %s debug image(s) for record %s to %s", len(image_paths), record_id, debug_dir)
+        cleanup_debug_dir()
         return debug_dir
     except Exception:
         logger.exception("could not save debug images for record %s", record_id)
@@ -214,7 +305,7 @@ def call_ia_api(image_paths: list[Path], debug_dir: Path | None = None) -> dict[
         with image_path.open("rb") as file_obj:
             response = requests.post(
                 IA_API_URL,
-                files={"image": (image_path.name, file_obj, "image/jpeg")},
+                files={"image": (image_path.name, file_obj, mime_type_for_image(image_path))},
                 timeout=IA_TIMEOUT_SECONDS,
             )
             response.raise_for_status()
@@ -288,9 +379,10 @@ def save_analysis(record: dict[str, Any], ia_result: dict[str, Any]) -> None:
             )
             analysis_id = cursor.fetchone()[0]
 
-            # Delete existing aggregate ibis items
+            # Delete existing analysis_images and associated ibis to ensure idempotency
+            cursor.execute("DELETE FROM analysis_images WHERE analysis_id = %s", (analysis_id,))
             cursor.execute("DELETE FROM ibis WHERE analysis_id = %s", (analysis_id,))
-            
+
             # Insert aggregate ibis items for backward compatibility
             for ibis_item in ibis_items:
                 cursor.execute(
@@ -311,7 +403,15 @@ def save_analysis(record: dict[str, Any], ia_result: dict[str, Any]) -> None:
                 image_url = record["images"][image_index] if image_index < len(record["images"]) else ""
                 image_ibis_items = [item for item in image_result.get("guaras", []) if isinstance(item, dict)]
                 image_ibis_quantity = image_result.get("quantidade_guaras", len(image_ibis_items))
-                raw_result = json.dumps(image_result, ensure_ascii=False)
+                raw_result = json.dumps(
+                    {
+                        "image_index": image_index,
+                        "image_url": image_url,
+                        "ibis_quantity": image_ibis_quantity,
+                        "result": image_result,
+                    },
+                    ensure_ascii=False,
+                )
 
                 # Insert analysis_image
                 cursor.execute(
@@ -332,12 +432,6 @@ def save_analysis(record: dict[str, Any], ia_result: dict[str, Any]) -> None:
                     ),
                 )
                 analysis_image_id = cursor.fetchone()[0]
-
-                # Delete existing ibis items for this analysis_image
-                cursor.execute(
-                    "DELETE FROM ibis WHERE analysis_image_id = %s",
-                    (analysis_image_id,),
-                )
 
                 # Insert per-image ibis detections
                 for ibis_item in image_ibis_items:
