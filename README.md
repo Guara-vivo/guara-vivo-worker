@@ -43,16 +43,16 @@ RABBITMQ_HEARTBEAT_SECONDS=600
 RABBITMQ_BLOCKED_CONNECTION_TIMEOUT_SECONDS=300
 
 # Debug (local apenas)
-DEBUG_SAVE_IMAGES_DIR=debug-images
+DEBUG_SAVE_IMAGES_DIR=
 DEBUG_MAX_RUNS=20
 ```
 
 **Notas importantes:**
 - `RABBITMQ_USER` e `RABBITMQ_PASSWORD` são obrigatórios (não use defaults `guest/guest` em produção).
-- `ALLOWED_IMAGE_HOSTS`: lista de domínios permitidos separados por vírgula (ex: `example.supabase.co,cdn.example.com`). Se vazio, qualquer host HTTPS é aceito.
+- `ALLOWED_IMAGE_HOSTS`: lista obrigatória de domínios permitidos separados por vírgula (ex: `example.supabase.co,cdn.example.com`).
 - `MAX_IMAGE_BYTES`: limite de bytes por imagem. Padrão 10 MB.
 - URLs sempre usam HTTPS; HTTP é rejeitado.
-- `DEBUG_SAVE_IMAGES_DIR`: se vazio, debug desativado. Limpar manualmente `debug-images/` periodicamente.
+- `DEBUG_SAVE_IMAGES_DIR`: se vazio, debug desativado. Habilite apenas em ambiente local/controlado, pois salva imagens, URLs e respostas da IA.
 
 ## Rodando localmente
 

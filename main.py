@@ -2,6 +2,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import tempfile
@@ -30,6 +31,10 @@ logging.basicConfig(
 logger = logging.getLogger("guara-vivo-worker")
 
 
+class RecordAlreadyProcessing(Exception):
+    pass
+
+
 DATABASE_URL = os.getenv("DATABASE_URL")
 RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "rabbitmq")
 RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", "5672"))
@@ -56,6 +61,8 @@ RABBITMQ_BLOCKED_CONNECTION_TIMEOUT_SECONDS = int(
 )
 DEBUG_MAX_RUNS = int(os.getenv("DEBUG_MAX_RUNS", "20"))
 PROGRESS_NOTIFY_CHANNEL = os.getenv("PROGRESS_NOTIFY_CHANNEL", "record_progress")
+ALLOWED_IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/webp"}
+URL_PATTERN = re.compile(r"https://[^\s'\"<>]+")
 
 
 if not DATABASE_URL:
@@ -89,6 +96,25 @@ def db_connection():
         raise
     finally:
         conn.close()
+
+
+@contextmanager
+def record_processing_lock(record_id: int):
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT pg_try_advisory_lock(%s)", (record_id,))
+            locked = cursor.fetchone()[0]
+            if not locked:
+                raise RecordAlreadyProcessing(f"record {record_id} is already being processed")
+        yield
+    finally:
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_unlock(%s)", (record_id,))
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def connect_rabbitmq() -> pika.BlockingConnection:
@@ -145,12 +171,37 @@ def set_record_progress(record_id: int, status: str, progress: int) -> None:
                 notify_record_progress(cursor, record_id, row[0], status, normalized_progress)
 
 
-def publish_error(channel: pika.channel.Channel, message: dict[str, Any], error: str) -> None:
-    payload = {
-        "message": message,
-        "error": error,
-        "failed_at": datetime.utcnow().isoformat(),
+def sanitize_url(value: str) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme == "https" and parsed.netloc:
+        return parsed._replace(query="", fragment="").geturl()
+    return value
+
+
+def sanitize_text(value: str) -> str:
+    return URL_PATTERN.sub(lambda match: sanitize_url(match.group(0)), value)
+
+
+def sanitize_payload(value: Any) -> Any:
+    if isinstance(value, str):
+        return sanitize_text(value)
+    if isinstance(value, dict):
+        return {key: sanitize_payload(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [sanitize_payload(item) for item in value]
+    return value
+
+
+def build_error_payload(message: dict[str, Any], error: str) -> dict[str, Any]:
+    return {
+        "message": sanitize_payload(message),
+        "error": sanitize_text(error),
+        "failed_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def publish_error(channel: pika.channel.Channel, message: dict[str, Any], error: str) -> None:
+    payload = build_error_payload(message, error)
     channel.basic_publish(
         exchange="",
         routing_key=ERROR_QUEUE_NAME,
@@ -209,13 +260,16 @@ def fetch_record(record_id: int) -> dict[str, Any]:
 
 
 def validate_image_url(image_url: str) -> None:
+    if not ALLOWED_IMAGE_HOSTS:
+        raise ValueError("ALLOWED_IMAGE_HOSTS must be configured")
+
     parsed = urlparse(image_url)
 
     if parsed.scheme != "https":
-        raise ValueError(f"image URL must use https: {image_url}")
+        raise ValueError(f"image URL must use https: {sanitize_url(image_url)}")
 
     if not parsed.hostname:
-        raise ValueError(f"image URL must contain hostname: {image_url}")
+        raise ValueError(f"image URL must contain hostname: {sanitize_url(image_url)}")
 
     hostname = parsed.hostname.lower()
 
@@ -228,13 +282,38 @@ def validate_image_url(image_url: str) -> None:
             raise ValueError(f"image URL resolves to unsafe IP: {hostname}")
 
 
+def normalize_content_type(content_type: str) -> str:
+    return content_type.lower().split(";", 1)[0].strip()
+
+
+def detect_image_mime(file_bytes: bytes) -> str | None:
+    if file_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if file_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if len(file_bytes) >= 12 and file_bytes.startswith(b"RIFF") and file_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def validate_downloaded_image(image_path: Path, expected_mime: str) -> None:
+    with image_path.open("rb") as file_obj:
+        header = file_obj.read(16)
+
+    actual_mime = detect_image_mime(header)
+    if actual_mime is None:
+        raise ValueError(f"image signature is not allowed: {image_path.name}")
+    if actual_mime != expected_mime:
+        raise ValueError(f"image signature does not match MIME type: {image_path.name}")
+
+
 def update_record_status(record_id: int, status: str) -> None:
     progress = 100 if status in {"completed", "failed"} else 0
     set_record_progress(record_id, status, progress)
 
 
 def guess_image_extension(content_type: str) -> str:
-    content_type = content_type.lower().split(";")[0].strip()
+    content_type = normalize_content_type(content_type)
     return {
         "image/jpeg": ".jpg",
         "image/png": ".png",
@@ -257,29 +336,42 @@ def download_images(image_urls: list[str], directory: Path) -> list[Path]:
     for index, image_url in enumerate(image_urls, start=1):
         validate_image_url(image_url)
 
-        with requests.get(image_url, timeout=DOWNLOAD_TIMEOUT_SECONDS, stream=True) as response:
-            response.raise_for_status()
+        try:
+            with requests.get(
+                image_url,
+                timeout=DOWNLOAD_TIMEOUT_SECONDS,
+                stream=True,
+                allow_redirects=False,
+            ) as response:
+                if 300 <= response.status_code < 400:
+                    raise ValueError(f"image redirect is not allowed: {sanitize_url(image_url)}")
 
-            content_type = response.headers.get("content-type", "")
-            if not content_type.lower().startswith("image/"):
-                raise ValueError(f"URL is not an image: {image_url}")
+                response.raise_for_status()
 
-            image_path = directory / f"image_{index}{guess_image_extension(content_type)}"
-            total_bytes = 0
+                content_type = normalize_content_type(response.headers.get("content-type", ""))
+                if content_type not in ALLOWED_IMAGE_MIME_TYPES:
+                    raise ValueError(f"image MIME type is not allowed: {content_type or 'missing'}")
 
-            with image_path.open("wb") as file_obj:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if not chunk:
-                        continue
+                image_path = directory / f"image_{index}{guess_image_extension(content_type)}"
+                total_bytes = 0
 
-                    total_bytes += len(chunk)
-                    if total_bytes > MAX_IMAGE_BYTES:
-                        raise ValueError(f"image exceeds max size: {image_url}")
+                with image_path.open("wb") as file_obj:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if not chunk:
+                            continue
 
-                    file_obj.write(chunk)
+                        total_bytes += len(chunk)
+                        if total_bytes > MAX_IMAGE_BYTES:
+                            raise ValueError(f"image exceeds max size: {sanitize_url(image_url)}")
+
+                        file_obj.write(chunk)
+        except requests.RequestException:
+            raise ValueError(f"could not download image: {sanitize_url(image_url)}") from None
 
         if image_path.stat().st_size == 0:
-            raise ValueError(f"downloaded empty image: {image_url}")
+            raise ValueError(f"downloaded empty image: {sanitize_url(image_url)}")
+
+        validate_downloaded_image(image_path, content_type)
 
         image_paths.append(image_path)
 
@@ -319,7 +411,7 @@ def save_debug_images(record_id: int, image_paths: list[Path], image_urls: list[
             shutil.copy2(image_path, debug_image_path)
             metadata.append(
                 {
-                    "source_url": image_urls[index] if index < len(image_urls) else None,
+                    "source_url": sanitize_url(image_urls[index]) if index < len(image_urls) else None,
                     "saved_file": debug_image_path.name,
                     "size_bytes": debug_image_path.stat().st_size,
                 }
@@ -430,8 +522,8 @@ def save_analysis(record: dict[str, Any], ia_result: dict[str, Any]) -> None:
             analysis_id = cursor.fetchone()[0]
 
             # Delete existing analysis_images and associated ibis to ensure idempotency
-            cursor.execute("DELETE FROM analysis_images WHERE analysis_id = %s", (analysis_id,))
             cursor.execute("DELETE FROM ibis WHERE analysis_id = %s", (analysis_id,))
+            cursor.execute("DELETE FROM analysis_images WHERE analysis_id = %s", (analysis_id,))
 
             # Insert aggregate ibis items for backward compatibility
             for ibis_item in ibis_items:
@@ -512,22 +604,23 @@ def save_analysis(record: dict[str, Any], ia_result: dict[str, Any]) -> None:
 
 
 def process_record(record_id: int) -> None:
-    work_dir = Path(tempfile.mkdtemp(prefix=f"guara_record_{record_id}_"))
-    try:
-        record = fetch_record(record_id)
-        image_paths = download_images(record["images"], work_dir)
-        set_record_progress(record_id, "processing", 20)
-        debug_dir = save_debug_images(record_id, image_paths, record["images"])
-        ia_result = call_ia_api(
-            image_paths,
-            debug_dir,
-            lambda progress: set_record_progress(record_id, "processing", progress),
-        )
-        set_record_progress(record_id, "processing", 90)
-        save_analysis(record, ia_result)
-        logger.info("record %s processed successfully", record_id)
-    finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
+    with record_processing_lock(record_id):
+        work_dir = Path(tempfile.mkdtemp(prefix=f"guara_record_{record_id}_"))
+        try:
+            record = fetch_record(record_id)
+            image_paths = download_images(record["images"], work_dir)
+            set_record_progress(record_id, "processing", 20)
+            debug_dir = save_debug_images(record_id, image_paths, record["images"])
+            ia_result = call_ia_api(
+                image_paths,
+                debug_dir,
+                lambda progress: set_record_progress(record_id, "processing", progress),
+            )
+            set_record_progress(record_id, "processing", 90)
+            save_analysis(record, ia_result)
+            logger.info("record %s processed successfully", record_id)
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def process_with_retries(record_id: int) -> None:
@@ -535,6 +628,9 @@ def process_with_retries(record_id: int) -> None:
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             process_record(record_id)
+            return
+        except RecordAlreadyProcessing:
+            logger.info("record %s is already being processed", record_id)
             return
         except Exception as exc:
             last_error = exc
