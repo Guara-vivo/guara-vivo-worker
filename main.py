@@ -9,7 +9,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 import pika
@@ -55,6 +55,7 @@ RABBITMQ_BLOCKED_CONNECTION_TIMEOUT_SECONDS = int(
     os.getenv("RABBITMQ_BLOCKED_CONNECTION_TIMEOUT_SECONDS", "300")
 )
 DEBUG_MAX_RUNS = int(os.getenv("DEBUG_MAX_RUNS", "20"))
+PROGRESS_NOTIFY_CHANNEL = os.getenv("PROGRESS_NOTIFY_CHANNEL", "record_progress")
 
 
 if not DATABASE_URL:
@@ -110,6 +111,40 @@ def setup_channel(connection: pika.BlockingConnection) -> pika.channel.Channel:
     return channel
 
 
+def notify_record_progress(cursor, record_id: int, user_id: int, status: str, progress: int) -> None:
+    payload = {
+        "record_id": record_id,
+        "user_id": user_id,
+        "status": status,
+        "analysis_progress": progress,
+    }
+    cursor.execute(
+        "SELECT pg_notify(%s, %s)",
+        (PROGRESS_NOTIFY_CHANNEL, json.dumps(payload, ensure_ascii=False)),
+    )
+
+
+def set_record_progress(record_id: int, status: str, progress: int) -> None:
+    normalized_progress = max(0, min(progress, 100))
+
+    with db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE records
+                SET status = %s,
+                    analysis_progress = %s
+                WHERE id = %s
+                RETURNING user_id
+                """,
+                (status, normalized_progress, record_id),
+            )
+            row = cursor.fetchone()
+
+            if row is not None:
+                notify_record_progress(cursor, record_id, row[0], status, normalized_progress)
+
+
 def publish_error(channel: pika.channel.Channel, message: dict[str, Any], error: str) -> None:
     payload = {
         "message": message,
@@ -146,14 +181,24 @@ def fetch_record(record_id: int) -> dict[str, Any]:
             cursor.execute(
                 """
                 UPDATE records
-                SET status = 'processing'
+                SET status = 'processing',
+                    analysis_progress = 5
                 WHERE id = %s
-                  AND status IN ('pending', 'failed')
-                RETURNING id, images, latitude_camera, longitude_camera, date_time
+                  AND status IN ('pending', 'failed', 'processing')
+                RETURNING id, images, latitude_camera, longitude_camera, date_time, user_id, status, analysis_progress
                 """,
                 (record_id,),
             )
             record = cursor.fetchone()
+
+            if record is not None:
+                notify_record_progress(
+                    cursor,
+                    record["id"],
+                    record["user_id"],
+                    record["status"],
+                    record["analysis_progress"],
+                )
 
     if record is None:
         raise ValueError(f"record {record_id} not found or not available for processing")
@@ -184,12 +229,8 @@ def validate_image_url(image_url: str) -> None:
 
 
 def update_record_status(record_id: int, status: str) -> None:
-    with db_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                "UPDATE records SET status = %s WHERE id = %s",
-                (status, record_id),
-            )
+    progress = 100 if status in {"completed", "failed"} else 0
+    set_record_progress(record_id, status, progress)
 
 
 def guess_image_extension(content_type: str) -> str:
@@ -296,12 +337,17 @@ def save_debug_images(record_id: int, image_paths: list[Path], image_urls: list[
         return None
 
 
-def call_ia_api(image_paths: list[Path], debug_dir: Path | None = None) -> dict[str, Any]:
+def call_ia_api(
+    image_paths: list[Path],
+    debug_dir: Path | None = None,
+    progress_callback: Callable[[int], None] | None = None,
+) -> dict[str, Any]:
     image_results = []
     all_guaras = []
     total_guaras = 0
 
-    for image_path in image_paths:
+    total_images = len(image_paths)
+    for image_index, image_path in enumerate(image_paths, start=1):
         with image_path.open("rb") as file_obj:
             response = requests.post(
                 IA_API_URL,
@@ -327,6 +373,10 @@ def call_ia_api(image_paths: list[Path], debug_dir: Path | None = None) -> dict[
             total_guaras += quantidade_guaras
         elif isinstance(guaras, list):
             total_guaras += len([item for item in guaras if isinstance(item, dict)])
+
+        if progress_callback is not None and total_images > 0:
+            progress = 25 + round((image_index / total_images) * 60)
+            progress_callback(min(progress, 85))
 
     result = {
         "quantidade_guaras": total_guaras,
@@ -450,9 +500,15 @@ def save_analysis(record: dict[str, Any], ia_result: dict[str, Any]) -> None:
                     )
 
             cursor.execute(
-                "UPDATE records SET status = 'completed' WHERE id = %s",
+                """
+                UPDATE records
+                SET status = 'completed',
+                    analysis_progress = 100
+                WHERE id = %s
+                """,
                 (record["id"],),
             )
+            notify_record_progress(cursor, record["id"], record["user_id"], "completed", 100)
 
 
 def process_record(record_id: int) -> None:
@@ -460,8 +516,14 @@ def process_record(record_id: int) -> None:
     try:
         record = fetch_record(record_id)
         image_paths = download_images(record["images"], work_dir)
+        set_record_progress(record_id, "processing", 20)
         debug_dir = save_debug_images(record_id, image_paths, record["images"])
-        ia_result = call_ia_api(image_paths, debug_dir)
+        ia_result = call_ia_api(
+            image_paths,
+            debug_dir,
+            lambda progress: set_record_progress(record_id, "processing", progress),
+        )
+        set_record_progress(record_id, "processing", 90)
         save_analysis(record, ia_result)
         logger.info("record %s processed successfully", record_id)
     finally:
