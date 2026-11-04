@@ -6,6 +6,7 @@ import re
 import shutil
 import socket
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ from urllib.parse import urlparse
 import pika
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 import requests
 from dotenv import load_dotenv
 
@@ -60,6 +62,7 @@ RABBITMQ_BLOCKED_CONNECTION_TIMEOUT_SECONDS = int(
     os.getenv("RABBITMQ_BLOCKED_CONNECTION_TIMEOUT_SECONDS", "300")
 )
 DEBUG_MAX_RUNS = int(os.getenv("DEBUG_MAX_RUNS", "20"))
+DATABASE_POOL_MAX = int(os.getenv("DATABASE_POOL_MAX", "3"))
 PROGRESS_NOTIFY_CHANNEL = os.getenv("PROGRESS_NOTIFY_CHANNEL", "record_progress")
 ALLOWED_IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/webp"}
 URL_PATTERN = re.compile(r"https://[^\s'\"<>]+")
@@ -85,17 +88,45 @@ def normalize_database_url(database_url: str) -> str:
 DATABASE_URL = normalize_database_url(DATABASE_URL)
 
 
+_db_pool: psycopg2.pool.ThreadedConnectionPool | None = None
+_db_pool_lock = threading.Lock()
+
+
+def get_db_pool() -> psycopg2.pool.ThreadedConnectionPool:
+    global _db_pool
+    with _db_pool_lock:
+        if _db_pool is None:
+            _db_pool = psycopg2.pool.ThreadedConnectionPool(1, DATABASE_POOL_MAX, DATABASE_URL)
+        return _db_pool
+
+
+def _checkout_connection():
+    """Borrow a live connection; connections the server dropped while idle are replaced."""
+    pool = get_db_pool()
+    for _ in range(DATABASE_POOL_MAX + 1):
+        conn = pool.getconn()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT 1")
+            conn.rollback()
+            return pool, conn
+        except Exception:
+            pool.putconn(conn, close=True)
+    raise RuntimeError("could not obtain a working database connection")
+
+
 @contextmanager
 def db_connection():
-    conn = psycopg2.connect(DATABASE_URL)
+    pool, conn = _checkout_connection()
     try:
         yield conn
         conn.commit()
     except Exception:
-        conn.rollback()
+        if not conn.closed:
+            conn.rollback()
         raise
     finally:
-        conn.close()
+        pool.putconn(conn, close=bool(conn.closed))
 
 
 @contextmanager
@@ -642,26 +673,73 @@ def process_with_retries(record_id: int) -> None:
     raise RuntimeError(f"record {record_id} failed after {MAX_RETRIES} attempts") from last_error
 
 
-def handle_message(channel, method, properties, body) -> None:
+def process_message_body(body: bytes) -> tuple[dict[str, Any] | None, Exception | None]:
+    """Run the job. Touches neither the channel nor the connection, so it can run in a thread."""
     message: dict[str, Any] | None = None
     try:
         message = parse_message(body)
         process_with_retries(message["record_id"])
-        channel.basic_ack(delivery_tag=method.delivery_tag)
+        return message, None
     except Exception as exc:
         logger.exception("message processing failed")
-        if message is not None:
-            publish_error(channel, message, str(exc))
-        channel.basic_ack(delivery_tag=method.delivery_tag)
+        return message, exc
+
+
+def finish_message(channel, method, message: dict[str, Any] | None, error: Exception | None) -> None:
+    """Answer the broker. Must run on the connection's thread (pika is not thread-safe).
+
+    If the error cannot be published the message is left unacked, so the broker redelivers it.
+    """
+    if error is not None and message is not None:
+        publish_error(channel, message, str(error))
+    channel.basic_ack(delivery_tag=method.delivery_tag)
+
+
+def handle_message(channel, method, properties, body) -> None:
+    message, error = process_message_body(body)
+    finish_message(channel, method, message, error)
+
+
+def make_threaded_handler(connection: pika.BlockingConnection, active_jobs: list[threading.Thread]):
+    """Consumer callback that runs each job in a thread.
+
+    Running a long job inside the callback would stop pika from answering broker heartbeats
+    (a record with many images can take minutes), and the broker would drop the connection.
+    The connection thread keeps serving I/O while the job runs; the ack goes back through
+    `add_callback_threadsafe`. With prefetch_count=1 there is at most one job at a time.
+    """
+
+    def on_message(channel, method, properties, body) -> None:
+        def job() -> None:
+            message, error = process_message_body(body)
+            try:
+                connection.add_callback_threadsafe(
+                    lambda: finish_message(channel, method, message, error)
+                )
+            except Exception:
+                # Connection is gone: the broker redelivers; the advisory lock prevents double work.
+                logger.exception("could not answer the broker for record message")
+
+        thread = threading.Thread(target=job, name="record-job", daemon=False)
+        active_jobs[:] = [item for item in active_jobs if item.is_alive()]
+        active_jobs.append(thread)
+        thread.start()
+
+    return on_message
 
 
 def run() -> None:
     logger.info("starting worker. queue=%s ia_api=%s", QUEUE_NAME, IA_API_URL)
+    # Shared across reconnects: a job started on a dropped connection may still be running.
+    active_jobs: list[threading.Thread] = []
     while True:
         try:
             connection = connect_rabbitmq()
             channel = setup_channel(connection)
-            channel.basic_consume(queue=QUEUE_NAME, on_message_callback=handle_message)
+            channel.basic_consume(
+                queue=QUEUE_NAME,
+                on_message_callback=make_threaded_handler(connection, active_jobs),
+            )
             logger.info("waiting for messages")
             channel.start_consuming()
         except pika.exceptions.AMQPConnectionError:
@@ -670,6 +748,10 @@ def run() -> None:
         except KeyboardInterrupt:
             logger.info("worker stopped")
             break
+
+    # Let a running job finish its DB writes before the process exits.
+    for job in active_jobs:
+        job.join(timeout=30)
 
 
 if __name__ == "__main__":
