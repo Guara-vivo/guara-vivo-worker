@@ -160,5 +160,117 @@ class WorkerHardeningTests(unittest.TestCase):
         self.assertLess(ibis_delete, images_delete)
 
 
+class ThreadedHandlerTests(unittest.TestCase):
+    def test_job_runs_in_a_thread_and_ack_goes_through_the_connection_thread(self):
+        import threading
+
+        main_thread = threading.get_ident()
+        seen = {}
+        done = threading.Event()
+
+        class Channel:
+            def __init__(self):
+                self.acked_on = None
+
+            def basic_ack(self, delivery_tag):
+                self.acked_on = threading.get_ident()
+
+        class Connection:
+            def add_callback_threadsafe(self, callback):
+                seen["callback"] = callback
+                done.set()
+
+        def fake_process(body):
+            seen["job_thread"] = threading.get_ident()
+            return {"record_id": 1}, None
+
+        channel, jobs = Channel(), []
+        method = type("Method", (), {"delivery_tag": 7})()
+
+        with patch.object(main, "process_message_body", side_effect=fake_process):
+            main.make_threaded_handler(Connection(), jobs)(channel, method, None, b"{}")
+            self.assertTrue(done.wait(5))
+            jobs[0].join(5)
+
+        # The callback only returned right away: nothing was acked from the job thread.
+        self.assertNotEqual(seen["job_thread"], main_thread)
+        self.assertIsNone(channel.acked_on)
+        seen["callback"]()  # what the connection thread does
+        self.assertEqual(channel.acked_on, main_thread)
+
+    def test_failed_job_publishes_error_then_acks(self):
+        order = []
+
+        class Channel:
+            def basic_ack(self, delivery_tag):
+                order.append("ack")
+
+        method = type("Method", (), {"delivery_tag": 1})()
+        with patch.object(main, "publish_error", side_effect=lambda *a: order.append("error")):
+            main.finish_message(Channel(), method, {"record_id": 1}, RuntimeError("boom"))
+        self.assertEqual(order, ["error", "ack"])
+
+    def test_dead_connection_is_logged_not_raised(self):
+        class Connection:
+            def add_callback_threadsafe(self, callback):
+                raise RuntimeError("connection closed")
+
+        jobs = []
+        method = type("Method", (), {"delivery_tag": 1})()
+        with patch.object(main, "process_message_body", return_value=({"record_id": 1}, None)),             patch.object(main.logger, "exception") as log:
+            main.make_threaded_handler(Connection(), jobs)(object(), method, None, b"{}")
+            jobs[0].join(5)
+        log.assert_called_once()
+
+
+class ConnectionPoolTests(unittest.TestCase):
+    def test_connections_are_reused_and_dead_ones_replaced(self):
+        class Conn:
+            def __init__(self, healthy):
+                self.healthy, self.closed, self.commits = healthy, 0, 0
+
+            def cursor(self):
+                conn = self
+
+                class Cur:
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *a):
+                        return False
+
+                    def execute(self, sql):
+                        if not conn.healthy:
+                            raise RuntimeError("server closed the connection")
+
+                return Cur()
+
+            def rollback(self):
+                pass
+
+            def commit(self):
+                self.commits += 1
+
+        class Pool:
+            def __init__(self, conns):
+                self.conns, self.returned = list(conns), []
+
+            def getconn(self):
+                return self.conns.pop(0)
+
+            def putconn(self, conn, close=False):
+                self.returned.append((conn, close))
+
+        dead, alive = Conn(False), Conn(True)
+        pool = Pool([dead, alive])
+
+        with patch.object(main, "get_db_pool", return_value=pool):
+            with main.db_connection() as conn:
+                self.assertIs(conn, alive)
+
+        self.assertEqual(pool.returned, [(dead, True), (alive, False)])
+        self.assertEqual(alive.commits, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

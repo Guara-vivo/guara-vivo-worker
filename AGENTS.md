@@ -10,3 +10,6 @@
 - `DEBUG_SAVE_IMAGES_DIR` saves downloaded images, `metadata.json`, `ia_result_*.json`, and `ia_result_aggregated.json` for debugging.
 - Keep `debug-images/` out of Git.
 
+- Each RabbitMQ message runs in its own thread (`make_threaded_handler`), so pika keeps answering broker heartbeats during long jobs. The ack and the error-queue publish go back through `connection.add_callback_threadsafe` (pika is not thread-safe). `prefetch_count=1` keeps it to one job at a time. If the error cannot be published the message stays unacked and is redelivered.
+- Postgres access uses a small `ThreadedConnectionPool` (`DATABASE_POOL_MAX`, default 3) with a `SELECT 1` check on checkout, instead of one new connection per call. The per-record advisory lock still uses its own dedicated connection and needs a direct (session-mode) Postgres connection, not Supabase's transaction pooler.
+- RabbitMQ's `consumer_timeout` (default 30 min) still bounds one job: many images x `IA_TIMEOUT_SECONDS` must stay below it.
