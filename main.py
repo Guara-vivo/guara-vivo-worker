@@ -505,6 +505,8 @@ def call_ia_api(
         "quantidade_guaras": total_guaras,
         "guaras": all_guaras,
         "imagens": image_results,
+        "status_analise": aggregate_status(image_results, total_guaras),
+        "avisos": aggregate_avisos(image_results),
     }
     if debug_dir is not None:
         (debug_dir / "ia_result_aggregated.json").write_text(
@@ -512,6 +514,37 @@ def call_ia_api(
             encoding="utf-8",
         )
     return result
+
+
+def aggregate_status(image_results: list[dict[str, Any]], total_guaras: int) -> str | None:
+    """Combine per-image status_analise; None when the identifier does not send it."""
+    statuses = [
+        r.get("status_analise")
+        for r in image_results
+        if isinstance(r, dict) and isinstance(r.get("status_analise"), str)
+    ]
+    if not statuses:
+        return None
+    if total_guaras > 0:
+        return "atencao" if "atencao" in statuses else "ok"
+    if "sem_guara" in statuses:
+        return "sem_guara"
+    return "sem_ave" if "sem_ave" in statuses else statuses[0]
+
+
+def aggregate_avisos(image_results: list[dict[str, Any]]) -> list[str] | None:
+    """Ordered, de-duplicated union of root avisos; None when no image sends the field."""
+    found = False
+    avisos: list[str] = []
+    for r in image_results:
+        value = r.get("avisos") if isinstance(r, dict) else None
+        if not isinstance(value, list):
+            continue
+        found = True
+        for aviso in value:
+            if isinstance(aviso, str) and aviso not in avisos:
+                avisos.append(aviso)
+    return avisos if found else None
 
 
 def extract_ibis_items(ia_result: dict[str, Any]) -> list[dict[str, Any]]:
@@ -537,17 +570,21 @@ def save_analysis(record: dict[str, Any], ia_result: dict[str, Any]) -> None:
             # Create or update aggregate analysis
             cursor.execute(
                 """
-                INSERT INTO analyses (ibis_quantity, datetime, recorder_id)
-                VALUES (%s, %s, %s)
+                INSERT INTO analyses (ibis_quantity, datetime, recorder_id, status_analise, avisos)
+                VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (recorder_id) DO UPDATE SET
                     ibis_quantity = EXCLUDED.ibis_quantity,
-                    datetime = EXCLUDED.datetime
+                    datetime = EXCLUDED.datetime,
+                    status_analise = EXCLUDED.status_analise,
+                    avisos = EXCLUDED.avisos
                 RETURNING id
                 """,
                 (
                     ibis_quantity,
                     record["date_time"],
                     record["id"],
+                    ia_result.get("status_analise"),
+                    ia_result.get("avisos"),
                 ),
             )
             analysis_id = cursor.fetchone()[0]
