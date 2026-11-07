@@ -33,6 +33,13 @@ logging.basicConfig(
 logger = logging.getLogger("guara-vivo-worker")
 
 
+def _positive_int(value: Any) -> int | None:
+    """Image size from the identifier; None when absent or invalid."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
 class RecordAlreadyProcessing(Exception):
     pass
 
@@ -627,8 +634,9 @@ def save_analysis(record: dict[str, Any], ia_result: dict[str, Any]) -> None:
                 cursor.execute(
                     """
                     INSERT INTO analysis_images 
-                    (analysis_id, record_id, image_index, image_url, ibis_quantity, raw_result, created_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    (analysis_id, record_id, image_index, image_url, ibis_quantity, raw_result, created_at,
+                     image_width, image_height)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                     """,
                     (
@@ -639,6 +647,8 @@ def save_analysis(record: dict[str, Any], ia_result: dict[str, Any]) -> None:
                         image_ibis_quantity,
                         raw_result,
                         datetime.now(timezone.utc),
+                        _positive_int(image_result.get("image_width")),
+                        _positive_int(image_result.get("image_height")),
                     ),
                 )
                 analysis_image_id = cursor.fetchone()[0]
