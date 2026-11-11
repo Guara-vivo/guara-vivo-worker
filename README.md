@@ -1,110 +1,84 @@
-# Guara Vivo Worker
+# Guará Vivo Worker
 
-Worker responsável por consumir jobs da fila RabbitMQ `guara-vermelho-inference`, baixar as imagens do registro, chamar a IA API e salvar o resultado no PostgreSQL/Supabase.
+Processo em segundo plano do Guará Vivo. Ele consome a fila RabbitMQ `guara-vermelho-inference`, e para cada registro novo: baixa as fotos, manda cada uma para o [identifier](https://github.com/Guara-vivo/guara-vivo-identifier) (a IA) e salva o resultado no PostgreSQL.
 
-## Fluxo
-
-1. Consome mensagem RabbitMQ: `{"record_id": 10}`.
-2. Atualiza `records.status` para `processing`.
-3. Busca as URLs em `records.images`.
-4. Baixa as imagens temporariamente para `/tmp`.
-5. Envia as imagens para `IA_API_URL` via `multipart/form-data`.
-6. Faz upsert em `analyses` usando `recorder_id = records.id`.
-7. Substitui os registros em `ibis` ligados a essa análise.
-8. Atualiza `records.status` para `completed` ou `failed`.
-9. Em caso de falha final, publica a mensagem em `guara-vermelho-inference-error`.
-
-## Variáveis de ambiente
-
-Copie `.env.example` para `.env` e ajuste os valores.
-
-```env
-DATABASE_URL=postgresql://user:password@host:5432/database
-RABBITMQ_HOST=rabbitmq
-RABBITMQ_PORT=5672
-RABBITMQ_USER=guara_worker
-RABBITMQ_PASSWORD=secure_password
-QUEUE_NAME=guara-vermelho-inference
-ERROR_QUEUE_NAME=guara-vermelho-inference-error
-IA_API_URL=http://ia-api:8000/guara-vermelho/inference
-
-# Timeouts e retries
-MAX_RETRIES=3
-DOWNLOAD_TIMEOUT_SECONDS=30
-IA_TIMEOUT_SECONDS=60
-LOG_LEVEL=INFO
-
-# Segurança
-ALLOWED_IMAGE_HOSTS=example.supabase.co
-MAX_IMAGE_BYTES=10485760
-
-# RabbitMQ
-RABBITMQ_HEARTBEAT_SECONDS=600
-RABBITMQ_BLOCKED_CONNECTION_TIMEOUT_SECONDS=300
-
-# Debug (local apenas)
-DEBUG_SAVE_IMAGES_DIR=
-DEBUG_MAX_RUNS=20
+```
+API ──publica {"record_id": 10}──> RabbitMQ ──> worker ──fotos──> identifier
+                                                   │
+                                                   └──resultado──> PostgreSQL (tabelas analyses, analysis_images, ibis)
 ```
 
-**Notas importantes:**
-- `RABBITMQ_USER` e `RABBITMQ_PASSWORD` são obrigatórios (não use defaults `guest/guest` em produção).
-- `ALLOWED_IMAGE_HOSTS`: lista obrigatória de domínios permitidos separados por vírgula (ex: `example.supabase.co,cdn.example.com`).
-- `MAX_IMAGE_BYTES`: limite de bytes por imagem. Padrão 10 MB.
-- URLs sempre usam HTTPS; HTTP é rejeitado.
-- `DEBUG_SAVE_IMAGES_DIR`: se vazio, debug desativado. Habilite apenas em ambiente local/controlado, pois salva imagens, URLs e respostas da IA.
+Em resumo, para cada mensagem: marca o registro como `processing`, baixa as imagens, chama a IA, grava a análise e marca como `completed` ou `failed`. Se falhar de vez, a mensagem vai para a fila `guara-vermelho-inference-error`.
+
+**Stack:** Python 3.12, pika (RabbitMQ), psycopg2 (PostgreSQL), requests.
+
+## O que você precisa antes
+
+O worker não faz nada sozinho: ele depende de três serviços no ar.
+
+| Serviço | Para quê |
+| --- | --- |
+| PostgreSQL | O mesmo banco da API, com as migrations já aplicadas (rode `alembic upgrade head` no repositório da API) |
+| RabbitMQ | A fila de onde ele lê os registros |
+| Identifier | A API de IA, normalmente em `http://localhost:8000` |
+
+> O jeito mais fácil de ter tudo isso é subir a stack completa pelo Docker Compose do repositório [`guara-vivo-api`](https://github.com/Guara-vivo/guara-vivo-api). Use este README quando quiser rodar **só o worker** em Python, por exemplo para depurar.
 
 ## Rodando localmente
 
-```bash
+```powershell
 python -m venv venv
-.\venv\Scripts\activate
+.\venv\Scripts\activate          # Linux/macOS: source venv/bin/activate
 pip install -r requirements.txt
+
+copy .env.example .env           # Linux/macOS: cp
+```
+
+Edite o `.env`. Variáveis principais (a lista completa está em [`docs/REFERENCIA.md`](docs/REFERENCIA.md)):
+
+| Variável | Valor para rodar fora do Docker |
+| --- | --- |
+| `DATABASE_URL` | Conexão PostgreSQL **direta** (não use o pooler do Supabase na porta 6543: o worker usa lock por registro, que não funciona nele) |
+| `RABBITMQ_HOST` / `RABBITMQ_PORT` | `localhost` / `5672` |
+| `RABBITMQ_USER` / `RABBITMQ_PASSWORD` | Obrigatórios, sem padrão. Use os mesmos do seu RabbitMQ |
+| `IA_API_URL` | `http://localhost:8000/guara-vermelho/inference` |
+| `ALLOWED_IMAGE_HOSTS` | Domínio do Storage de onde vêm as fotos (ex.: `seu-projeto.supabase.co`). Só HTTPS é aceito |
+| `DEBUG_SAVE_IMAGES_DIR` | Opcional. Se preenchido, salva as imagens e os JSONs da IA nessa pasta, para depuração (deixe vazio em produção) |
+
+Suba o worker:
+
+```powershell
 python main.py
 ```
 
-## Docker
+Ele fica rodando e esperando mensagens. Para testar de ponta a ponta, crie um registro com fotos pela API ou pelo app e acompanhe o log do worker.
+
+### Com Docker
 
 ```bash
 docker build -t guara-vivo-worker .
 docker run --env-file .env guara-vivo-worker
 ```
 
-## Contrato esperado da IA API
+Dentro do Docker, `localhost` aponta para o próprio container. Ajuste `RABBITMQ_HOST` e `IA_API_URL` para os nomes dos serviços da sua rede Docker.
 
-O Worker aceita respostas da IA com a seguinte estrutura:
+## Testes
 
-```json
-{
-  "quantidade_guaras": 2,
-  "guaras": [
-    {
-      "cor": "vermelho",
-      "fase_vida": "adulto",
-      "acuracia": {
-        "deteccao_yolo": 0.98,
-        "classificacao_guara": 0.97,
-        "classificacao_cor": 0.95,
-        "classificacao_fase_vida": 0.93
-      }
-    },
-    {
-      "cor": "vermelho",
-      "fase_vida": "juvenil",
-      "acuracia": {
-        "deteccao_yolo": 0.95,
-        "classificacao_guara": 0.94,
-        "classificacao_cor": 0.92,
-        "classificacao_fase_vida": 0.90
-      }
-    }
-  ]
-}
+Não precisam de banco, RabbitMQ nem IA.
+
+```powershell
+pip install pytest
+python -m pytest -q
 ```
 
-**Campos importantes:**
-- `quantidade_guaras`: número inteiro de guarás detectados
-- `guaras`: lista de objetos de detecção
-  - `cor`: cor do pássaro (ex: "vermelho")
-  - `fase_vida`: fase de vida (ex: "adulto", "juvenil")
-  - `acuracia`: objeto com métricas de confiança de cada etapa do modelo
+## Estrutura
+
+```
+main.py    todo o worker (consumo da fila, download, chamada da IA, gravação)
+tests/     testes (pytest)
+docs/      documentação de referência
+```
+
+## Mais detalhes
+
+O contrato esperado da resposta da IA, o fluxo completo e todas as variáveis de ambiente estão em [`docs/REFERENCIA.md`](docs/REFERENCIA.md).
