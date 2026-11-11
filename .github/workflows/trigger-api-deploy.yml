@@ -4,6 +4,10 @@ on:
   push:
     branches:
       - main
+    # Mudanças só de documentação não precisam de deploy.
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
   workflow_dispatch:
 
 jobs:
