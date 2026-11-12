@@ -100,12 +100,27 @@ class LivenessTests(unittest.TestCase):
             liveness.write_pulse(missing_dir)
         self.assertIn("could not write liveness pulse", logs.output[0])
 
-    def test_start_pulse_writes_initial_pulse(self):
+    def test_start_pulse_does_not_stamp_when_the_loop_is_stuck(self):
+        # A connection that drops right after connecting must not look healthy on every reconnect:
+        # the first stamp has to go through the I/O loop, not be written directly.
         stop = threading.Event()
         thread = liveness.start_pulse(SilentConnection(), stop, path=self.path, interval=60)
         self.addCleanup(thread.join, 1)
         self.addCleanup(stop.set)
+        time.sleep(0.1)
+        self.assertFalse(liveness.is_alive(self.path))
+
+    def test_start_pulse_requests_first_pulse_without_waiting_an_interval(self):
+        connection = FakeConnection()
+        stop = threading.Event()
+        thread = liveness.start_pulse(connection, stop, path=self.path, interval=60)
+        self.addCleanup(thread.join, 1)
+        self.addCleanup(stop.set)
+        deadline = time.time() + 1
+        while not liveness.is_alive(self.path) and time.time() < deadline:
+            time.sleep(0.01)
         self.assertTrue(liveness.is_alive(self.path))
+        self.assertEqual(connection.calls, 1)
 
     def test_start_pulse_calls_callback_and_stops(self):
         connection = FakeConnection()

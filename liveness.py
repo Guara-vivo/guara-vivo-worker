@@ -47,15 +47,18 @@ def start_pulse(
 
     The callback runs on the connection thread, so a stuck loop or a dropped connection stops the
     pulse and the file ages. A long record job runs in its own thread and does not stop it.
+    Even the first stamp goes through the loop: writing it directly would keep a worker that
+    reconnects and drops every few seconds looking healthy.
     """
-    write_pulse(path)
 
     def pulse() -> None:
-        while not stop.wait(interval):
+        while True:
             try:
                 connection.add_callback_threadsafe(lambda: write_pulse(path))
             except Exception:
                 logger.info("connection closed; liveness pulse stopped")
+                return
+            if stop.wait(interval):
                 return
 
     thread = threading.Thread(target=pulse, name="liveness-pulse", daemon=True)
