@@ -21,6 +21,8 @@ import psycopg2.pool
 import requests
 from dotenv import load_dotenv
 
+import liveness
+
 
 load_dotenv()
 
@@ -780,8 +782,10 @@ def run() -> None:
     # Shared across reconnects: a job started on a dropped connection may still be running.
     active_jobs: list[threading.Thread] = []
     while True:
+        stop_pulse = threading.Event()
         try:
             connection = connect_rabbitmq()
+            liveness.start_pulse(connection, stop_pulse)
             channel = setup_channel(connection)
             channel.basic_consume(
                 queue=QUEUE_NAME,
@@ -795,6 +799,8 @@ def run() -> None:
         except KeyboardInterrupt:
             logger.info("worker stopped")
             break
+        finally:
+            stop_pulse.set()
 
     # Let a running job finish its DB writes before the process exits.
     for job in active_jobs:
