@@ -155,5 +155,25 @@ class LivenessTests(unittest.TestCase):
         self.assertNotIn("Traceback", fresh.stderr)
 
 
+class DockerfileTests(unittest.TestCase):
+    """No Docker on the dev machine: guard the image definition by reading the Dockerfile."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.lines = (ROOT / "Dockerfile").read_text(encoding="utf-8").splitlines()
+
+    def test_image_ships_the_liveness_module(self):
+        # main.py imports liveness: an image without it would crash on start.
+        copies = [line for line in self.lines if line.strip().startswith("COPY ")]
+        self.assertTrue(any("liveness.py" in line.split() for line in copies))
+
+    def test_healthcheck_runs_liveness_with_the_planned_timings(self):
+        checks = [line for line in self.lines if line.strip().startswith("HEALTHCHECK")]
+        self.assertEqual(len(checks), 1)
+        check = checks[0]
+        for expected in ("--interval=30s", "--timeout=5s", "--start-period=60s", "--retries=3", "liveness.py"):
+            self.assertIn(expected, check)
+
+
 if __name__ == "__main__":
     unittest.main()
