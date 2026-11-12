@@ -1,9 +1,12 @@
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+import pika
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -270,6 +273,52 @@ class ConnectionPoolTests(unittest.TestCase):
 
         self.assertEqual(pool.returned, [(dead, True), (alive, False)])
         self.assertEqual(alive.commits, 1)
+
+
+class RunLoopPulseTests(unittest.TestCase):
+    """`run()` keeps one liveness pulse per RabbitMQ connection and stops it when the connection ends."""
+
+    def run_with_errors(self, *errors):
+        stops = []
+
+        class FakeChannel:
+            def __init__(self):
+                self.remaining = list(errors)
+
+            def basic_consume(self, **kwargs):
+                pass
+
+            def start_consuming(self):
+                raise self.remaining.pop(0)
+
+        channel = FakeChannel()
+
+        def fake_start_pulse(connection, stop, *args, **kwargs):
+            stops.append(stop)
+            return threading.Thread()
+
+        with patch.object(main, "connect_rabbitmq", return_value=object()), \
+                patch.object(main, "setup_channel", return_value=channel), \
+                patch.object(main.liveness, "start_pulse", side_effect=fake_start_pulse), \
+                patch.object(main.time, "sleep"):
+            try:
+                main.run()
+                error = None
+            except Exception as exc:
+                error = exc
+        return stops, error
+
+    def test_run_starts_pulse_for_each_connection_and_stops_it(self):
+        stops, error = self.run_with_errors(pika.exceptions.AMQPConnectionError(), KeyboardInterrupt())
+        self.assertIsNone(error)
+        self.assertEqual(len(stops), 2)
+        self.assertTrue(all(stop.is_set() for stop in stops))
+
+    def test_run_stops_pulse_on_unexpected_error(self):
+        stops, error = self.run_with_errors(RuntimeError("boom"))
+        self.assertIsInstance(error, RuntimeError)
+        self.assertEqual(len(stops), 1)
+        self.assertTrue(stops[0].is_set())
 
 
 if __name__ == "__main__":
