@@ -62,6 +62,8 @@ docker run --env-file .env guara-vivo-worker
 
 Dentro do Docker, `localhost` aponta para o próprio container. Ajuste `RABBITMQ_HOST` e `IA_API_URL` para os nomes dos serviços da sua rede Docker.
 
+A imagem tem um `HEALTHCHECK`: enquanto a conexão com o RabbitMQ está viva, o worker grava a hora em `/tmp/worker-alive` a cada 15 s, e o Docker roda `python liveness.py`, que falha se o arquivo sumir ou tiver mais de 90 s. Veja o estado com `docker ps` (`healthy` / `unhealthy`). Um job longo não deixa o contêiner `unhealthy`, porque os jobs rodam em threads próprias. O caminho do arquivo pode ser trocado com `WORKER_LIVENESS_FILE`.
+
 ## Testes
 
 Não precisam de banco, RabbitMQ nem IA.
@@ -74,9 +76,10 @@ python -m pytest -q
 ## Estrutura
 
 ```
-main.py    todo o worker (consumo da fila, download, chamada da IA, gravação)
-tests/     testes (pytest)
-docs/      documentação de referência
+main.py        o worker (consumo da fila, download, chamada da IA, gravação)
+liveness.py    pulso de vida e o HEALTHCHECK do Docker (só biblioteca padrão, não importa o main)
+tests/         testes (pytest)
+docs/          documentação de referência
 ```
 
 ## Mais detalhes
