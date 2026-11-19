@@ -8,10 +8,44 @@ on:
     paths-ignore:
       - "**.md"
       - "docs/**"
+  pull_request:
   workflow_dispatch:
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+      - name: Run tests
+        run: python -m pytest -q
+
+  audit:
+    # Aparece no run, mas nunca bloqueia o deploy: avisos novos surgem com o tempo e não podem
+    # travar uma correção urgente (mesma regra da API).
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Audit dependencies
+        run: pip install pip-audit && pip-audit -r requirements.txt
+
   trigger-deploy:
+    needs: test
+    # Em PR ou disparo manual noutra branch só rodam os testes.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
